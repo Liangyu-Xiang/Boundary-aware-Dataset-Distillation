@@ -3,6 +3,7 @@ Fine-tuning DiT with minimax criteria.
 """
 import sys
 import torch
+import torch.nn as nn
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -11,6 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
+from torchvision.transforms import v2
 import numpy as np
 from collections import OrderedDict, defaultdict
 from PIL import Image
@@ -20,12 +22,14 @@ from time import time
 import argparse
 import logging
 import os
-
+import train_models.resnet as RN
 from data import ImageFolder
 from models import DiT_models
 from download import find_model
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from resnet import resnet18
+from data import transform_imagenet
 
 
 #################################################################################
@@ -126,6 +130,10 @@ def mark_difffit_trainable(model, is_bitfit=False):
         par_tensor.requires_grad = any([kw in par_name for kw in trainable_names])
     return model
 
+        
+
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -176,7 +184,8 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae_path = f"./pretrained_models/stabilityai/sd-vae-ft-{args.vae}"
+    vae = AutoencoderKL.from_pretrained(vae_path).to(device)
     vae.eval()
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -187,6 +196,33 @@ def main(args):
     total_params = sum(p.numel() for p in params_to_optimize)
     print(f"Number of Trainable Parameters: {total_params * 1.e-6:.2f} M")
     opt = torch.optim.AdamW(params_to_optimize, lr=1e-3, weight_decay=0)
+
+    # Load expert model (e.g. ResNet18)
+    # expert_model = RN.ResNet('imagenet',
+    #                       18,
+    #                       10,
+    #                       norm_type='instance',
+    #                       size=224,
+    #                       nch=3).to(device)
+    # expert_path = "/data/mmc_lyxiang/DD/MinimaxDiffusion/results/imagenet10/resnet18in_resnet18imagewoof_cut/model_best.pth.tar"
+    # state_dict = torch.load(expert_path)["state_dict"]
+    # expert_model = resnet18(pretrained=False).to(device)
+    # expert_path = "/data/mmc_lyxiang/KD/EKD/output/Evidential_Teacher/ResNet18_ImageNet/student_best"
+    # state_dict = torch.load(expert_path)["model"]
+    # expert_model.load_state_dict(state_dict)
+    # expert_model.eval()
+    # for p in expert_model.parameters():
+    #     p.requires_grad = False  # 不计算分类器的梯度
+    # expert_loss = nn.MSELoss()
+    # expert_transform = v2.Compose([
+    #                     v2.Resize(256),
+    #                     v2.CenterCrop(224),
+    #                     v2.Normalize(mean=[0.485, 0.456, 0.406],
+    #                                 std=[0.229, 0.224, 0.225])
+    #                 ])
+    # transform, _ =  transform_imagenet(augment=False,
+    #                             size=224,
+    #                             from_tensor=True)
 
     # Setup data:
     transform = transforms.Compose([
@@ -224,16 +260,19 @@ def main(args):
     # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
-    running_loss, running_loss_pos, running_loss_neg = 0, 0, 0
+    running_loss, running_loss_pos, running_loss_neg, running_loss_add = 0, 0, 0, 0
     start_time = time()
     real_memory = defaultdict(list)
     pseudo_memory = defaultdict(list)
+    # real_belief_memory = defaultdict(list)
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
+        epoch_start_time = time()
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, ry, y in loader:
+        for x, ry, y in loader:     
+
             ry = ry.numpy()
             x = x.to(device)
             y = y.to(device)
@@ -249,10 +288,26 @@ def main(args):
             # Calculate minimax criteria
             pos_match_loss = torch.tensor(0.).to(device)
             neg_match_loss = torch.tensor(0.).to(device)
+            # classifier_loss = torch.tensor(0.).to(device)
             if args.condense:
                 ry_set = set(ry)
                 num_ry = len(ry_set)
                 for c in ry_set:
+                    # input = vae.decode(pseudo_embeddings[ry == c] / 0.18215).sample
+                    
+                    # woof_indices = [155, 159, 162, 167, 182, 193, 207, 229, 258, 273]
+                    # logits = expert_model(expert_transform(input))[0][:, woof_indices]
+                    # transform, _ =  transform_imagenet(augment=False,
+                    #                                 size=224,
+                    #                                 from_tensor=True)
+                    # logits = expert_model(transform(input))
+
+                    # evidence = torch.exp(logits)
+                    # alpha = evidence + torch.exp(torch.tensor(-1.43))
+                    # # alpha = evidence + 1
+                    # S = torch.sum(alpha, dim=-1, keepdim=True)
+                    # belief, u = evidence / S, torch.exp(torch.tensor(-1.43)) * 10 / S
+                    # belief, u = evidence / S, 10 / S
                     if len(pseudo_memory[c]):
                         pos_embeddings = torch.cat(real_memory[c]).flatten(start_dim=1)
                         neg_embeddings = torch.cat(pseudo_memory[c]).flatten(start_dim=1)
@@ -266,18 +321,87 @@ def main(args):
                         ).max()
                         pos_match_loss += pos_feat_sim * args.lambda_pos / num_ry
                         neg_match_loss += neg_feat_sim * args.lambda_neg / num_ry
+                        # Distill multiple subjective opinion into one
+                        # current_combined_belief, current_combined_u = dempster_combination(belief, u)
+                        # real_combined_belief, real_combined_u = dempster_combination(torch.cat(real_belief_memory[c])[:,:10], torch.cat(real_belief_memory[c])[:,-1:])
+                        # classifier_loss += expert_loss(current_combined_belief, real_combined_belief) + expert_loss(current_combined_u, real_combined_u) 
 
                     # Update the auxiliary memories
                     real_memory[c].extend(x[ry == c].detach().split(1))
                     pseudo_memory[c].extend(pseudo_embeddings[ry == c].detach().split(1))
+                    # belief_memory_update = torch.cat((belief, u), dim=1)
+                    # real_belief_memory[c].extend(belief_memory_update.detach().split(1))
                     while len(real_memory[c]) > args.memory_size:
                         real_memory[c].pop(0)
                     while len(pseudo_memory[c]) > args.memory_size:
                         pseudo_memory[c].pop(0)
+                    # while len(real_belief_memory[c]) > args.memory_size * 2:
+                    #     real_belief_memory[c].pop(0)
+                    
 
                 all_loss = loss + pos_match_loss + neg_match_loss
             else:
                 all_loss = loss
+
+            # Data Uncertainty minimization
+            # input = vae.decode(pseudo_embeddings / 0.18215).sample
+            
+            # transform = v2.Compose([
+            #     v2.Resize(256),
+            #     v2.CenterCrop(224),
+            #     v2.Normalize(mean=[0.485, 0.456, 0.406],
+            #                 std=[0.229, 0.224, 0.225])
+            # ])
+            # woof_indices = [155, 159, 162, 167, 182, 193, 207, 229, 258, 273]
+            # logits = expert_model(transform(input))[0][:, woof_indices]
+            # # compute aleatoric uncertainty
+            # alpha = torch.exp(logits) + torch.exp(torch.tensor(-1.46))
+            # S = torch.sum(alpha, dim=1, keepdim=True)
+            # data_u_loss = 1 - torch.sum(alpha ** 2, dim=1, keepdim=True) / (S ** 2)
+            # data_u_loss = 0.002 * data_u_loss.mean()
+            # all_loss += data_u_loss
+
+            # compute dissonance
+            # evidence = torch.exp(logits)
+            # S = torch.sum(evidence, dim=1, keepdim=True)
+            # belief = evidence / S
+            # belief_j = belief.unsqueeze(2)
+            # belief_i = belief.unsqueeze(1)
+            # denom_pair = belief_j + belief_i
+            # bal = torch.where(denom_pair > 0,
+            #           1.0 - (belief_j - belief_i).abs() / (denom_pair + 1e-12),
+            #           torch.zeros_like(denom_pair))
+            # eye = torch.eye(evidence.shape[1], device=device).unsqueeze(0)
+            # bal = bal * (1.0 - eye)
+            # numerator = (belief.unsqueeze(2) * bal).sum(dim=1)
+            # denom = (belief.sum(dim=1, keepdim=True) - belief)
+            # A = torch.where(denom > 1e-12, numerator / (denom + 1e-12), torch.zeros_like(denom))
+            # diss = (belief * A).sum(dim=1)
+            # data_u_loss = 0.002 * diss.mean()
+            # all_loss += data_u_loss
+            
+            # Compute the expected entropy of the data distribution as aleatoric uncertainty (Prior and Posterior)
+            # alpha = torch.exp(logits) + torch.exp(torch.tensor(-1.43))
+            # S = torch.sum(alpha, dim=1, keepdim=True)
+            # temp = alpha * (torch.digamma(alpha + 1) - torch.digamma(S + 1)) / S
+            # data_u_loss = -torch.sum(temp, dim=1)
+            # data_u_loss = 0 * data_u_loss.mean()
+            # all_loss += data_u_loss
+
+            # Evidential CE loss
+            # num_classes = len(woof_indices)
+            # indices = torch.tensor([woof_indices.index(val.item()) for val in y]).to(y.device)
+            # one_hot = torch.zeros(y.size(0), num_classes).to(y.device)
+            # one_hot.scatter_(1, indices.unsqueeze(1), 1)
+            # alpha = torch.exp(logits) + torch.exp(torch.tensor(-1.43))
+            # S = torch.sum(alpha, dim=1, keepdim=True)
+            # # labels_1hot = torch.zeros_like(logits).scatter_(-1, y.unsqueeze(-1), 1)
+            # loss_ce = 0.001 * torch.sum(one_hot * (torch.digamma(S)-torch.digamma(alpha)), dim=-1).mean()
+            # all_loss += loss_ce
+
+
+
+
 
             opt.zero_grad()
             all_loss.backward()
@@ -289,6 +413,8 @@ def main(args):
             if pos_match_loss or neg_match_loss:
                 running_loss_pos += pos_match_loss.item()
                 running_loss_neg += neg_match_loss.item()
+            # running_loss_add += classifier_loss.item()
+
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -300,13 +426,16 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_loss_pos = torch.tensor(running_loss_pos / log_steps, device=device)
                 avg_loss_neg = torch.tensor(running_loss_neg / log_steps, device=device)
+                # avg_loss_alea = torch.tensor(running_loss_add / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_loss_pos, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_loss_neg, op=dist.ReduceOp.SUM)
+                # dist.all_reduce(avg_loss_alea, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_loss_pos = avg_loss_pos.item() / dist.get_world_size()
                 avg_loss_neg = avg_loss_neg.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} {avg_loss_pos:.4f} {avg_loss_neg:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                # avg_loss_alea = avg_loss_alea.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f} {avg_loss_pos:.4f} {avg_loss_neg:.4f} Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 running_loss_pos = 0
@@ -327,6 +456,24 @@ def main(args):
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
+
+        epoch_time = time() - epoch_start_time
+        logger.info(f"Epoch {epoch} finished in {epoch_time:.2f} seconds ({epoch_time/60:.2f} minutes)")
+        if rank == 0:
+            checkpoint = {
+                "model": model.module.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": opt.state_dict(),
+                "args": args,
+                "epoch": epoch,
+                "train_steps": train_steps
+            }
+            checkpoint_path = f"{checkpoint_dir}/epoch_{epoch:03d}.pt"
+            torch.save(checkpoint, checkpoint_path)
+            logger.info(f"[Epoch {epoch}] Saved checkpoint to {checkpoint_path}")
+
+        dist.barrier()
+
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...

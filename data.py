@@ -4,6 +4,7 @@ import torchvision.datasets as datasets
 from torchvision.utils import save_image
 import torch.nn.functional as F
 import os
+import ast
 import numpy as np
 import warnings
 from misc import utils
@@ -51,6 +52,7 @@ class ImageFolder(datasets.DatasetFolder):
     def __init__(self,
                  root,
                  transform=None,
+                 expert_transform=None,
                  target_transform=None,
                  loader=datasets.folder.default_loader,
                  is_valid_file=None,
@@ -70,7 +72,7 @@ class ImageFolder(datasets.DatasetFolder):
                                           transform=transform,
                                           target_transform=target_transform,
                                           is_valid_file=is_valid_file)
-
+        self.expert_transform = expert_transform
         # Override
         self.spec = spec
         self.return_origin = return_origin
@@ -109,6 +111,10 @@ class ImageFolder(datasets.DatasetFolder):
                 file_list = './misc/class_woof.txt'
             elif self.spec == 'nette':
                 file_list = './misc/class_nette.txt'
+            elif self.spec == "100":
+                file_list = './misc/class100.txt'
+            elif self.spec == "1k":
+                file_list = "./misc/class_indices.txt"
             else:
                 file_list = './misc/class100.txt'
             with open(file_list, 'r') as f:
@@ -188,17 +194,175 @@ class ImageFolder(datasets.DatasetFolder):
 
         target = self.targets[index]
         original_target = self.original_targets[index]
-        if self.transform is not None:
-            sample = self.transform(sample)
+
+        sample_dit = self.transform(sample) if self.transform is not None else sample
+        if self.expert_transform is not None:
+            sample_expert = self.expert_transform(sample)
+        else:
+            sample_expert = sample_dit   # fallback（不推荐，但安全）
+
         if self.target_transform is not None:
             target = self.target_transform(target)
             original_target = self.target_transform(original_target)
 
         # Return original labels for DiT generation
         if self.return_origin:
-            return sample, target, original_target
+            if self.expert_transform is not None:
+                return sample_dit, sample_expert, target, original_target
+            else:
+            # return sample_dit, sample_expert, target, original_target
+                return sample_dit, target, original_target
         else:
-            return sample, target
+            return sample_dit, target
+
+
+
+class MultiLabelImageFolder(ImageFolder):
+    """
+    w0: return two target indices, shape (2,)
+    w1: return a single target index, compatible with standard cross entropy
+
+    Filename example:
+    [229, 229, 229, 229]_[258, 258, 258, 258]_w0_2.png
+    """
+
+    DEFAULT_MULTI_LABELS = [155, 159, 162, 167, 182, 193, 207, 229, 258, 273]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.multi_label_map = {
+            label: idx for idx, label in enumerate(self.DEFAULT_MULTI_LABELS)
+        }
+
+        self.sample_label_info = self._parse_all_filenames()
+
+    def _parse_all_filenames(self):
+        parsed = []
+        for path, _ in self.samples:
+            parsed.append(self._extract_label_info_from_path(path))
+        return parsed
+
+    def _extract_redundant_label(self, label_str):
+        """
+        Parse strings like:
+            [229, 229, 229, 229]
+        and return the single effective label: 229
+
+        For robustness, this checks all entries are identical.
+        """
+        try:
+            values = ast.literal_eval(label_str)
+        except (ValueError, SyntaxError):
+            return None
+
+        if not isinstance(values, list) or len(values) == 0:
+            return None
+
+        try:
+            values = [int(v) for v in values]
+        except (TypeError, ValueError):
+            return None
+
+        first = values[0]
+        if any(v != first for v in values):
+            # If you prefer tolerant behavior, replace this with: return first
+            return None
+
+        return first
+
+    def _map_label(self, raw_label):
+        if raw_label not in self.multi_label_map:
+            return None
+        return self.multi_label_map[raw_label]
+
+    def _extract_label_info_from_path(self, path):
+        """
+        Return one of:
+            {"mode": "multi", "labels": [idx_a, idx_b]}
+            {"mode": "single", "label": idx_a}
+        """
+        filename = os.path.splitext(os.path.basename(path))[0]
+
+        if "_w0_" in filename:
+            mode_flag = "w0"
+            split_token = "_w0_"
+        elif "_w1_" in filename:
+            mode_flag = "w1"
+            split_token = "_w1_"
+        else:
+            return None
+
+        prefix = filename.split(split_token)[0]
+        parts = prefix.split("_", 1)
+        if len(parts) != 2:
+            return None
+
+        current_label_str, extra_label_str = parts
+
+        current_raw = self._extract_redundant_label(current_label_str)
+        extra_raw = self._extract_redundant_label(extra_label_str)
+
+        if current_raw is None:
+            return None
+
+        current_idx = self._map_label(current_raw)
+        if current_idx is None:
+            return None
+
+        if mode_flag == "w0":
+            if extra_raw is None:
+                return None
+            extra_idx = self._map_label(extra_raw)
+            if extra_idx is None:
+                return None
+
+            return {
+                "mode": "multi",
+                "labels": [current_idx, extra_idx],
+            }
+
+        return {
+            "mode": "single",
+            "label": current_idx,
+        }
+
+    def __getitem__(self, index):
+        if not self.load_memory:
+            path = self.samples[index][0]
+            sample = self.loader(path)
+        else:
+            sample = self.imgs[index]
+
+        target = self.targets[index]
+        original_target = self.original_targets[index]
+        label_info = self.sample_label_info[index]
+
+        sample_dit = self.transform(sample) if self.transform is not None else sample
+        if self.expert_transform is not None:
+            sample_expert = self.expert_transform(sample)
+        else:
+            sample_expert = sample_dit
+
+        # Always return a 1D tensor of length 2 so the default collate works.
+        if label_info is not None:
+            if label_info["mode"] == "multi":
+                target = torch.tensor(label_info["labels"], dtype=torch.long)
+            else:
+                label = int(label_info["label"])
+                target = torch.tensor([label, label], dtype=torch.long)
+        else:
+            target = torch.tensor([int(target), int(target)], dtype=torch.long)
+
+        if self.target_transform is not None:
+            original_target = self.target_transform(original_target)
+
+        if self.return_origin:
+            if self.expert_transform is not None:
+                return sample_dit, sample_expert, target, original_target
+            return sample_dit, target, original_target
+
+        return sample_dit, target
 
 
 def transform_cifar(augment=False, from_tensor=False, normalize=True):
@@ -633,15 +797,23 @@ def load_data(args, tsne=False):
                                                              size=args.size,
                                                              from_tensor=False)
         train_dataset = ImageFolder(traindir,
-                                    train_transform,
+                                    transform=train_transform,
                                     nclass=args.nclass,
                                     seed=args.dseed,
                                     slct_type=args.slct_type,
                                     ipc=args.ipc,
                                     load_memory=args.load_memory,
                                     spec=args.spec)
+        # train_dataset = MultiLabelImageFolder(traindir,
+        #                     train_transform,
+        #                     nclass=args.nclass,
+        #                     seed=args.dseed,
+        #                     slct_type=args.slct_type,
+        #                     ipc=args.ipc,
+        #                     load_memory=args.load_memory,
+        #                     spec=args.spec)
         val_dataset = ImageFolder(valdir,
-                                  test_transform,
+                                  transform=test_transform,
                                   nclass=args.nclass,
                                   seed=args.dseed,
                                   load_memory=args.load_memory,

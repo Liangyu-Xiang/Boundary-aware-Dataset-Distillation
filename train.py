@@ -8,6 +8,7 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torchvision.models as models
+import torch.nn.functional as F
 import train_models.resnet as RN
 import train_models.resnet_ap as RNAP
 import train_models.convnet as CN
@@ -17,6 +18,10 @@ from misc.utils import random_indices, rand_bbox, AverageMeter, accuracy, get_ti
 from efficientnet_pytorch import EfficientNet
 import time
 import warnings
+import swanlab
+from resnet import resnet18
+
+
 
 warnings.filterwarnings("ignore")
 model_names = sorted(
@@ -29,6 +34,8 @@ for key, val in MEANS.items():
     mean_torch[key] = torch.tensor(val, device='cuda').reshape(1, len(val), 1, 1)
 for key, val in STDS.items():
     std_torch[key] = torch.tensor(val, device='cuda').reshape(1, len(val), 1, 1)
+
+
 
 
 def define_model(args, nclass, logger=None, size=None):
@@ -94,6 +101,7 @@ def main(args, logger, repeat=1):
         best_acc_l.append(best_acc)
         acc_l.append(acc)
 
+    swanlab.log({f'\n(Repeat {repeat}) Best, last acc: {np.mean(best_acc_l):.1f} {np.std(best_acc_l):.1f}'})
     logger(f'\n(Repeat {repeat}) Best, last acc: {np.mean(best_acc_l):.1f} {np.std(best_acc_l):.1f}')
 
 
@@ -109,12 +117,14 @@ def train(args, model, train_loader, val_loader, plotter=None, logger=None):
 
     # Load pretrained
     cur_epoch, best_acc1, best_acc5, acc1, acc5 = 0, 0, 0, 0, 0
+
     if args.pretrained:
         pretrained = "{}/{}".format(args.save_dir, 'checkpoint.pth.tar')
         cur_epoch, best_acc1 = load_checkpoint(pretrained, model, optimizer)
         # TODO: optimizer scheduler steps
 
     model = model.cuda()
+
     logger(f"Start training with base augmentation and {args.mixup} mixup")
 
     # Start training and validation
@@ -140,6 +150,7 @@ def train(args, model, train_loader, val_loader, plotter=None, logger=None):
                 best_acc5 = acc5
                 if logger != None and args.verbose == True:
                     logger(f'Best accuracy (top-1 and 5): {best_acc1:.1f} {best_acc5:.1f}')
+                swanlab.log({"best_acc5": best_acc5, "best_acc1": best_acc1}, step=epoch)
 
         if args.save_ckpt and (is_best or (epoch == args.epochs)):
             state = {
@@ -154,6 +165,45 @@ def train(args, model, train_loader, val_loader, plotter=None, logger=None):
         scheduler.step()
 
     return best_acc1, acc1
+
+def distillation_loss(logits_s, logits_t, temperature):
+    log_pred_student = F.log_softmax(logits_s / temperature, dim=1)
+    pred_teacher = F.softmax(logits_t / temperature, dim=1)
+    loss_kd = F.kl_div(log_pred_student, pred_teacher, reduction="none").sum(1).mean()
+    loss_kd *= temperature**2
+    return loss_kd
+
+def evidential_criterion(logits, target):
+    evidence = F.softplus(logits)
+    alpha = evidence + 1
+    labels_1hot = torch.zeros_like(logits).scatter_(-1, target.unsqueeze(-1), 1)
+    S = torch.sum(alpha, dim=-1, keepdim=True)
+    loss_ce = torch.sum(labels_1hot * (torch.digamma(S)-torch.digamma(alpha)), dim=-1).mean()
+    return loss_ce
+
+def compute_sample_weight(teacher_output, target, mode="conf", eps=1e-8, temperature=1.0):
+    with torch.no_grad():
+        p = torch.softmax(teacher_output, dim=1)
+        pc = p.gather(1, target.view(-1,1)).squeeze(1)
+
+        if mode == "conf":
+            s = 1.0 - pc
+        elif mode == "nll":
+            s = -torch.log(pc.clamp_min(eps))
+        elif mode == "entropy":
+            s = -(p * (p.clamp_min(eps)).log()).sum(dim=1)
+        elif mode == "chi":
+            s = torch.sqrt((1.0 - pc).clamp_min(0.0) / pc.clamp_min(eps))
+        else:
+            raise ValueError(f"unknown mode: {mode}")
+
+        if temperature != 1.0:
+            s = s.pow(1.0 / temperature)
+
+        # s = s / (s.mean().detach() + eps)
+
+        # s = s.clamp(0.25, 4.0).detach()
+    return s
 
 
 def train_epoch(args,
@@ -195,10 +245,13 @@ def train_epoch(args,
 
             output = model(input)
             loss = criterion(output, target) * ratio + criterion(output, target_b) * (1. - ratio)
+            # loss = evidential_criterion(output, target)* ratio + evidential_criterion(output, target_b) * (1. - ratio)
+            
         else:
             # compute output
             output = model(input)
             loss = criterion(output, target)
+
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output.data, target, topk=(1, 5))
@@ -224,7 +277,7 @@ def train_epoch(args,
         logger(
             '(Train) [Epoch {0}/{1}] {2} Top1 {top1.avg:.1f}  Top5 {top5.avg:.1f}  Loss {loss.avg:.3f}'
             .format(epoch, args.epochs, get_time(), top1=top1, top5=top5, loss=losses))
-
+    swanlab.log({"train_acc1": top1.avg, "train_acc5": top5.avg, "train_loss": losses.avg}, step=epoch)
     return top1.avg, top5.avg, losses.avg
 
 
@@ -261,6 +314,7 @@ def validate(args, val_loader, model, criterion, epoch, logger=None):
         logger(
             '(Test ) [Epoch {0}/{1}] {2} Top1 {top1.avg:.1f}  Top5 {top5.avg:.1f}  Loss {loss.avg:.3f}'
             .format(epoch, args.epochs, get_time(), top1=top1, top5=top5, loss=losses))
+    swanlab.log({"test_acc1": top1.avg, "test_acc5": top5.avg, "test_loss": losses.avg}, step=epoch)
     return top1.avg, top5.avg, losses.avg
 
 
@@ -301,5 +355,10 @@ if __name__ == '__main__':
     os.makedirs(args.save_dir, exist_ok=True)
     logger = Logger(args.save_dir)
     logger(f"Save dir: {args.save_dir}")
-
+    if not args.test:
+        run = swanlab.init(
+            project= "DDresnet18-Expert",
+            experiment_name= args.tag,
+            x_axis="epoch"
+        )
     main(args, logger, args.repeat)

@@ -154,6 +154,28 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+class BoundaryEmbedder(nn.Module):
+    """
+    将连续标量边界距离 d 映射到 hidden_size 维，
+    用于 FiLM / adaLN 条件调制。
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+    def forward(self, d):
+        """
+        d: (N,) 或 (N,1)
+        返回: (N, hidden_size)
+        """
+        if d.dim() == 1:
+            d = d.unsqueeze(1)
+        return self.mlp(d)
+
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -236,6 +258,9 @@ class DiT(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # ✅ 新增：边界距离 FiLM 条件嵌入器
+        # self.d_embedder = BoundaryEmbedder(hidden_size)
+        # self.ml_embedder = nn.Embedding(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -272,6 +297,13 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        # for m in self.d_embedder.mlp:
+        #     if isinstance(m, nn.Linear):
+        #         nn.init.normal_(m.weight, std=0.02)
+        #         if m.bias is not None:
+        #             nn.init.constant_(m.bias, 0.0)
+
+
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -298,6 +330,55 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    # def forward(self, x, t, y):
+        # """
+        # Forward pass of DiT.
+        # x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+        # t: (N,) tensor of diffusion timesteps
+        # y: (N,) tensor of class labels
+        # """
+        # N = x.shape[0]
+        # x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        # t = self.t_embedder(t)                   # (N, D)
+
+        # if y.shape[0] == 4:
+        #     bound_weights = y[-1]
+        #     y = y[:-1]
+        #     y = y.long()
+        #     bound_mask = (y[1] != 1000)
+        #     bound_weights = bound_weights * bound_mask.float()
+        #     ori_shape_y = y.shape
+        #     y = self.y_embedder(y, self.training)    # (N, D)
+        #     #  multi_label_emd = self.ml_embedder()
+        #     # Support multi-conditioning by averaging embeddings:
+        #     y = y.view(*ori_shape_y, -1)
+        #     one_tensor = torch.ones_like(bound_weights)  # shape = [B]
+        #     weights = torch.stack([1 - bound_weights, bound_weights], 0 )
+        #     weights = weights.unsqueeze(2)
+        #     cond_y = (y[:-1] * weights).sum(dim=0)
+        #     y = torch.cat([cond_y, y[-1, :]],0)
+        # elif y.shape[0] == 3:
+        #     label_weights = y[-1]
+        #     y = y[:-1]
+        #     y = y.long()
+        #     ori_shape_y = y.shape
+        #     one_tensor = torch.ones_like(label_weights)  # shape = [B]
+        #     weights = torch.stack([1 - label_weights, label_weights], 0)
+        #     weights = weights.unsqueeze(2)
+        #     y = y.view(-1)
+        #     y = self.y_embedder(y, self.training)
+        #     y = y.view(*ori_shape_y, -1)
+        #     y = (y * weights).sum(dim=0)
+        # else:
+        #     y = y.view(-1)
+        #     y = y.long()
+        #     y = self.y_embedder(y, self.training)
+        # c = t + y                                # (N, D)
+        # for block in self.blocks:
+        #     x = block(x, c)                      # (N, T, D)
+        # x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
+        # x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        # return x
     def forward(self, x, t, y):
         """
         Forward pass of DiT.
@@ -305,16 +386,99 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        N = x.shape[0]
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        # if d is None:
+        #     d_embed = torch.zeros_like(t)
+        # else:
+        #     d = d.to(t.device)
+        #     d_embed = self.d_embedder(d)  # (N, D)
+
+        if y.dim() > 1 and y.shape[0] == 4:
+            bound_weights = y[-1]
+            y = y[:-1]
+            y = y.long()
+            bound_mask = (y[1] != 1000)
+            bound_weights = bound_weights * bound_mask.float()
+            ori_shape_y = y.shape
+            y = self.y_embedder(y, self.training)    # (N, D)
+            #  multi_label_emd = self.ml_embedder()
+            # Support multi-conditioning by averaging embeddings:
+            y = y.view(*ori_shape_y, -1)
+            one_tensor = torch.ones_like(bound_weights)  # shape = [B]
+            weights = torch.stack([1 - bound_weights, bound_weights], 0 )
+            weights = weights.unsqueeze(2)
+            cond_y = (y[:-1] * weights).sum(dim=0)
+            y = torch.cat([cond_y, y[-1, :]],0)
+        elif y.dim() > 1 and y.shape[0] == 3:
+            label_weights = y[-1]
+            y = y[:-1]
+            y = y.long()
+            ori_shape_y = y.shape
+            one_tensor = torch.ones_like(label_weights)  # shape = [B]
+            weights = torch.stack([1 - label_weights, label_weights], 0)
+            weights = weights.unsqueeze(2)
+            y = y.view(-1)
+            y = self.y_embedder(y, self.training)
+            y = y.view(*ori_shape_y, -1)
+            y = (y * weights).sum(dim=0)
+        # elif y.shape[0] == 2 and y.dim() > 1:
+        #     y = y.view(-1)
+        #     # bound_y = y[-1]
+        #     # bound_mask = (bound_y != 1000)
+        #     # primary_y = y[0]
+        #     # y = self.y_embedder(primary_y, self.training)
+        #     # bound_y = self.y_embedder(bound_y, self.training)
+        #     # y[bound_mask] = 0.5 * y[bound_mask] + 0.5 * bound_y[bound_mask]
+        #     y = torch.cat(y[0], y[1])
+        else:
+            y = y.view(-1)
+            y = y.long()
+            y = self.y_embedder(y, self.training)
+        c = t + y                               # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
+
+        
+
+    # def forward_with_cfg(self, x, t, y, cfg_scale):
+    #     """
+    #     Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+    #     """
+    #     # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+    #     # if len(y) == 2:
+    #     half = x[: len(x) // 2]
+    #     combined = torch.cat([half, half], dim=0)
+    #     # else:
+    #     #     half = x[0] # Only suppose batch_size=1
+    #     #     combined = half.repeat(len(y), 1, 1, 1)
+    #     model_out = self.forward(combined, t, y)
+    #     # For exact reproducibility reasons, we apply classifier-free guidance on only
+    #     # three channels by default. The standard approach to cfg applies it to all channels.
+    #     # This can be done by uncommenting the following line and commenting-out the line following that.
+    #     # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+    #     eps, rest = model_out[:, :3], model_out[:, 3:]
+    #     # if len(y) == 2:
+    #     cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+    #     half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+    #     eps = torch.cat([half_eps, half_eps], dim=0)
+    #     # else:
+    #     #     cond_eps, uncond_eps = eps[:-1], eps[-1]
+    #     #     weights = torch.tensor(cfg_scale)[:,None, None, None].to(cond_eps.device)
+    #     #     # target_weight, non_target_weight = weights[:1], weights[1:]
+    #     #     # decayed_non_target_weight = non_target_weight * (t[0] / 999)
+    #     #     #decayed_non_target_weight = non_target_weight * 0.5 * (1 + torch.cos(torch.tensor(torch.pi) * (t[0] / 999)))
+    #     #     # dynamic_weights = torch.cat([target_weight, decayed_non_target_weight], dim=0)
+    #     #     weighted_cond_eps = torch.sum(weights * (cond_eps - uncond_eps), dim=0, keepdim=True)
+    #     #     half_eps = uncond_eps + weighted_cond_eps
+    #     #     eps = half_eps.repeat(len(y), 1, 1, 1)
+        
+    #     return torch.cat([eps, rest], dim=1)
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
@@ -322,16 +486,90 @@ class DiT(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
+        # if d is not None:
+        #     # d 也要 repeat 成 2B
+        #     d_half = d[: len(d) // 2]
+        #     d_combined = torch.cat([d_half, d_half], dim=0)
+        # else:
+        #     d_combined = None
+    
+        if y.dim() > 1 and y.shape[0] == 4:
+            combine_weights = y[-1]
+            # if combine_weights <
+            primary_label = y[0]
+            bound_label = y[1]
+            uncond_label = y[2]
+            primary_y = torch.cat([primary_label, uncond_label], dim=0)
+            bound_y = torch.cat([bound_label, uncond_label], dim=0)
+            primary_model_out = self.forward(combined, t, primary_y)
+            bound_model_out = self.forward(combined, t, bound_y)
+            eps_primary, rest_primary = primary_model_out[:, :3], primary_model_out[:, 3:]
+            eps_bound, rest_bound = bound_model_out[:, :3], bound_model_out[:, 3:]
+            cond_eps_primary, uncond_eps_primary = torch.split(eps_primary, len(eps_primary) // 2, dim=0)
+            cond_eps_bound, uncond_eps_bound = torch.split(eps_bound, len(eps_bound) // 2, dim=0)
+            combine_weights = combine_weights[:, None, None, None]
+            half_eps_primary = uncond_eps_primary + combine_weights * cfg_scale * (cond_eps_primary - uncond_eps_primary) \
+                + (1 - combine_weights) * cfg_scale * (cond_eps_bound - uncond_eps_bound)
+            # half_eps_primary = uncond_eps_primary + cfg_scale * (cond_eps_primary - uncond_eps_primary) \
+            #     + combine_weights * cfg_scale * (cond_eps_bound - uncond_eps_bound)
+            # half_eps_primary = uncond_eps_primary + combine_weights * cfg_scale * (cond_eps_primary - uncond_eps_primary) \
+            #  - 0.1 * combine_weights * cfg_scale * (cond_eps_bound - uncond_eps_bound)
+            # half_eps_primary = uncond_eps_primary + cfg_scale * ( (1 - 0.5 *combine_weights) * cond_eps_primary + 0.5 * combine_weights * cond_eps_bound - uncond_eps_primary)
+            eps = torch.cat([half_eps_primary, half_eps_primary], dim=0)
+            rest = rest_primary  # 采用主标签的rest
+        
+        else:
+            model_out = self.forward(combined, t, y)
+            # For exact reproducibility reasons, we apply classifier-free guidance on only
+            # three channels by default. The standard approach to cfg applies it to all channels.
+            # This can be done by uncommenting the following line and commenting-out the line following that.
+            # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+            eps, rest = model_out[:, :3], model_out[:, 3:]
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+        
         return torch.cat([eps, rest], dim=1)
+    
+    # def forward_with_cfg(self, x, t, y, cfg_scale):
+    #     """
+    #     Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance,
+    #     while allowing multiple labels `ys` and corresponding `cfg_scales`.
+    #     """
+    #     # Ensure ys and cfg_scales are both lists or tensors of the same length
+    #     assert len(y) == len(cfg_scale), "Number of labels (ys) must match number of cfg_scales"
+        
+    #     half = x[: len(x) // 2]
+        
+    #     # Repeat the image data for each label in ys
+    #     combined = torch.cat([half] * len(y), dim=0)
+        
+    #     # Compute the model output with all labels concatenated
+    #     model_out = self.forward(combined, t, torch.cat(y, dim=0))
+        
+    #     # For reproducibility reasons, apply classifier-free guidance only to the first 3 channels
+    #     eps, rest = model_out[:, :3], model_out[:, 3:]
+
+    #     # Initialize a list to hold the updated eps values
+    #     updated_eps_list = []
+
+    #     # Loop through each pair of (label, cfg_scale) for the batch
+    #     for i in range(len(ys)):
+    #         # Split the eps values into conditional and unconditional parts
+    #         cond_eps, uncond_eps = torch.split(eps[i * len(x) // 2 : (i + 1) * len(x) // 2], len(eps) // (2 * len(ys)), dim=0)
+            
+    #         # Apply classifier-free guidance with different cfg_scales
+    #         half_eps = uncond_eps + cfg_scale[i] * (cond_eps - uncond_eps)
+            
+    #         # Store the updated eps values for the current label
+    #         updated_eps_list.append(half_eps)
+
+    #     # Concatenate all updated eps values
+    #     half_eps_final = torch.cat(updated_eps_list, dim=0)
+
+    #     # Combine the updated eps values with the rest of the model output
+    #     eps = torch.cat([half_eps_final, half_eps_final], dim=0)
+    #     return torch.cat([eps, rest], dim=1)
 
 
 #################################################################################

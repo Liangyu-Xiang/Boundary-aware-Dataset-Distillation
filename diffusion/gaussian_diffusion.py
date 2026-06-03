@@ -497,6 +497,10 @@ class GaussianDiffusion:
 
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
+            # if i == 20:
+            # #     # model_kwargs['y'] = th.cat([model_kwargs['y'][:1], model_kwargs['y'][2].unsqueeze(0)], dim=0)
+            #     model_kwargs['y'] = th.cat([model_kwargs['y'][:1], model_kwargs['y'][2].unsqueeze(0)], dim=0)
+                # model_kwargs['cfg_scale'] = 4.0
             with th.no_grad():
                 out = self.p_sample(
                     model,

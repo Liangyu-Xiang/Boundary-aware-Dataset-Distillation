@@ -12,7 +12,7 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
 import argparse
-
+from resnet import resnet18
 
 def main(args):
     # Setup PyTorch:
@@ -28,20 +28,32 @@ def main(args):
         file_list = './misc/class_woof.txt'
     elif args.spec == 'nette':
         file_list = './misc/class_nette.txt'
-    else:
+    elif args.spec == '100':
         file_list = './misc/class100.txt'
+    elif args.spec == '1k':
+        file_list = './misc/class_indices.txt'
+    else:
+        raise ValueError(f"Unsupported dataset spec '{args.spec}'.")
     with open(file_list, 'r') as fp:
         sel_classes = fp.readlines()
 
+    # =========================
+    # Class range selection
+    # =========================
+    num_all_classes = len(all_classes)
+
     phase = max(0, args.phase)
     cls_from = args.nclass * phase
-    cls_to = args.nclass * (phase + 1)
+    cls_to = min(num_all_classes, args.nclass * (phase + 1))
     sel_classes = sel_classes[cls_from:cls_to]
     sel_classes = [sel_class.strip() for sel_class in sel_classes]
     class_labels = []
+    all_class_labels = []
     
     for sel_class in sel_classes:
         class_labels.append(all_classes.index(sel_class))
+    for a_class in all_classes:
+        all_class_labels.append(all_classes.index(a_class))
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
@@ -60,11 +72,21 @@ def main(args):
     model.load_state_dict(state_dict, strict=False)
     model.eval()  # important!
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    print(args.vae)
+    vae_path = f"./pretrained_models/stabilityai/sd-vae-ft-{args.vae}"
+    vae = AutoencoderKL.from_pretrained(vae_path).to(device)
+
+    # expert_model = resnet18(pretrained=False).to(device)
+    # expert_path = "/data/mmc_lyxiang/KD/EKD/output/Evidential_Teacher/ResNet18_ImageNet/student_best"
+    # state_dict = torch.load(expert_path)["model"]
+    # expert_model.load_state_dict(state_dict)
+    # expert_model.eval()
+
 
     batch_size = 1
 
     for class_label, sel_class in zip(class_labels, sel_classes):
+        print(class_label)
         os.makedirs(os.path.join(args.save_dir, sel_class), exist_ok=True)
         for shift in tqdm(range(args.num_samples // batch_size)):
             # Create sampling noise:

@@ -1,6 +1,20 @@
 # Customized
 *.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.safetensors
 results/
+outputs/
+logs/
+swanlog/
+swanlab/
+pretrained_models/
+margin_heatmap_results/
+/.codex/
+/.codex
+/.vscode/
+/*.png
 *.pdf
 
 # Byte-compiled / optimized / DLL files

@@ -250,6 +250,12 @@ parser.add_argument('--same_compute',
 parser.add_argument('--name', type=str, default='', help='name of the test data folder')
 parser.add_argument('--spec', type=str, default='none')
 
+
+# selection
+parser.add_argument("--entropy_threshold", type=float, default=0.5, help="maximum entropy to select confident samples")
+parser.add_argument("--copy_original", action="store_true", help="copy original image files instead of re-saving them as PNG")
+
+
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=False)
 args = parser.parse_args()
