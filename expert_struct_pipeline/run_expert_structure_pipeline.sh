@@ -150,6 +150,7 @@ if [ "${RUN_EVAL}" = "1" ]; then
         --ipc "${IPC}" \
         --spec "${GENSPEC}" \
         --repeat 1 \
+        --disable-summary-log \
         -- "${EVAL_CMD[@]}"
     done
   else

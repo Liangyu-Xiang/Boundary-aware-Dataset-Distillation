@@ -25,6 +25,11 @@ def parse_args():
     parser.add_argument("--ipc", type=int, required=True)
     parser.add_argument("--spec", required=True)
     parser.add_argument("--repeat", type=int, required=True)
+    parser.add_argument(
+        "--disable-summary-log",
+        action="store_true",
+        help="Do not log parsed mean/std summary metrics.",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -89,7 +94,7 @@ def main():
             )
 
         summary_match = SUMMARY_RE.search(line)
-        if summary_match:
+        if summary_match and not args.disable_summary_log:
             swanlab.log(
                 {
                     "best_acc_mean": float(summary_match.group(2)),
@@ -103,7 +108,7 @@ def main():
 
     return_code = proc.wait()
 
-    if repeat_best_acc and not summary_logged:
+    if repeat_best_acc and not summary_logged and not args.disable_summary_log:
         swanlab.log(
             {
                 "best_acc_mean": float(np.mean(repeat_best_acc)),
