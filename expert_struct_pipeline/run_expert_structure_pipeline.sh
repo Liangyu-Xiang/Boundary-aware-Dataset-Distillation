@@ -28,6 +28,7 @@ NUM_CANDIDATES=${NUM_CANDIDATES:-4}
 RUN_EVAL=${RUN_EVAL:-1}
 RUN_EVAL_SWANLAB=${RUN_EVAL_SWANLAB:-1}
 EVAL_REPEAT=${EVAL_REPEAT:-3}
+EVAL_SEED=${EVAL_SEED:-42}
 SWANLAB_PROJECT=${SWANLAB_PROJECT:-Boundary-aware-Dataset-Distillation}
 SWANLAB_RUN=${SWANLAB_RUN:-"${PROJECT}_${EXPERT_MODEL}_ipc${IPC}_cfg${CFG}"}
 
@@ -120,33 +121,55 @@ python "${PIPELINE_DIR}/sample_mult_label_sel_expert.py" \
   --expert-ckpt "${EXPERT_CKPT}"
 
 if [ "${RUN_EVAL}" = "1" ]; then
-  EVAL_CMD=(
-    python main_validate_random.py
-    --subset "${SPEC}"
-    --arch-name "resnet18"
-    --factor 2
-    --num-crop 5
-    --mipc 300
-    --ipc "${IPC}"
-    --stud-name "resnet18"
-    --re-epochs 300
-    --train-dir "${IMAGENET_TRAIN_PATH}"
-    --val-dir "${IMAGENET_VAL_PATH}"
-    --repeat "${EVAL_REPEAT}"
-    --syn-data-path "${SAMPLE_SAVE_DIR}"
-  )
-
   if [ "${RUN_EVAL_SWANLAB}" = "1" ]; then
-    python "${ROOT_DIR}/swanlab_eval_wrapper.py" \
-      --work-dir "${EVAL_DIR}" \
-      --swanlab-project "${SWANLAB_PROJECT}" \
-      --swanlab-run "${SWANLAB_RUN}" \
-      --cfg "${CFG}" \
-      --ipc "${IPC}" \
-      --spec "${GENSPEC}" \
-      --repeat "${EVAL_REPEAT}" \
-      -- "${EVAL_CMD[@]}"
+    for repeat_idx in $(seq 1 "${EVAL_REPEAT}"); do
+      current_seed=$((EVAL_SEED + repeat_idx - 1))
+      repeat_name=$(printf "%s_repeat%02d" "${SWANLAB_RUN}" "${repeat_idx}")
+      EVAL_CMD=(
+        python main_validate_random.py
+        --subset "${SPEC}"
+        --arch-name "resnet18"
+        --factor 2
+        --num-crop 5
+        --mipc 300
+        --ipc "${IPC}"
+        --stud-name "resnet18"
+        --re-epochs 300
+        --train-dir "${IMAGENET_TRAIN_PATH}"
+        --val-dir "${IMAGENET_VAL_PATH}"
+        --repeat 1
+        --seed "${current_seed}"
+        --syn-data-path "${SAMPLE_SAVE_DIR}"
+      )
+
+      python "${ROOT_DIR}/swanlab_eval_wrapper.py" \
+        --work-dir "${EVAL_DIR}" \
+        --swanlab-project "${SWANLAB_PROJECT}" \
+        --swanlab-run "${repeat_name}" \
+        --cfg "${CFG}" \
+        --ipc "${IPC}" \
+        --spec "${GENSPEC}" \
+        --repeat 1 \
+        -- "${EVAL_CMD[@]}"
+    done
   else
+    EVAL_CMD=(
+      python main_validate_random.py
+      --subset "${SPEC}"
+      --arch-name "resnet18"
+      --factor 2
+      --num-crop 5
+      --mipc 300
+      --ipc "${IPC}"
+      --stud-name "resnet18"
+      --re-epochs 300
+      --train-dir "${IMAGENET_TRAIN_PATH}"
+      --val-dir "${IMAGENET_VAL_PATH}"
+      --repeat "${EVAL_REPEAT}"
+      --seed "${EVAL_SEED}"
+      --syn-data-path "${SAMPLE_SAVE_DIR}"
+    )
+
     cd "${EVAL_DIR}"
     "${EVAL_CMD[@]}"
   fi
